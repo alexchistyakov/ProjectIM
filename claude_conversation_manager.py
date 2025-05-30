@@ -71,7 +71,7 @@ class PersistentShell:
         # Start bash with the user's profile to ensure proper initialization
         # Use --login to source profile files and get the full user environment
         self.shell = subprocess.Popen(
-            ['/bin/bash', '--login'],  # Use login shell to get full environment
+            ['/bin/bash'],  # Use login shell to get full environment
             stdin=slave,
             stdout=slave,
             stderr=slave,
