@@ -301,6 +301,51 @@ class ConversationManager:
                     },
                     "required": ["command"]
                 }
+            },
+            {
+                "name": "read_file",
+                "description": "Read file contents with automatic pagination for large files. Returns file content in chunks that fit within token limits.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Path to the file to read (absolute or relative to current directory)"
+                        },
+                        "start_line": {
+                            "type": "integer",
+                            "description": "Starting line number (1-based). Default: 1"
+                        },
+                        "max_lines": {
+                            "type": "integer",
+                            "description": "Maximum number of lines to read. Default: 500"
+                        }
+                    },
+                    "required": ["path"]
+                }
+            },
+            {
+                "name": "write_file",
+                "description": "Write or append content to a file using Python's file operations. Creates parent directories if needed.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Path to the file to write (absolute or relative to current directory)"
+                        },
+                        "content": {
+                            "type": "string",
+                            "description": "Content to write to the file"
+                        },
+                        "mode": {
+                            "type": "string",
+                            "description": "Write mode: 'write' (overwrite) or 'append'. Default: 'write'",
+                            "enum": ["write", "append"]
+                        }
+                    },
+                    "required": ["path", "content"]
+                }
             }
         ]
     
@@ -326,6 +371,115 @@ class ConversationManager:
                 
             except Exception as e:
                 error_msg = f"Error executing command: {str(e)}"
+                logger.error(error_msg, exc_info=True)
+                return error_msg
+        
+        elif tool_name == "read_file":
+            path = arguments["path"]
+            start_line = arguments.get("start_line", 1)
+            max_lines = arguments.get("max_lines", 500)
+            
+            try:
+                # Resolve path relative to current directory
+                if not Path(path).is_absolute():
+                    # Get current directory from shell
+                    pwd_result = self.shell.execute_command("pwd", 2)
+                    current_dir = pwd_result.strip()
+                    if current_dir and current_dir.startswith('/'):
+                        file_path = Path(current_dir) / path
+                    else:
+                        file_path = Path(path)
+                else:
+                    file_path = Path(path)
+                
+                # Check if file exists
+                if not file_path.exists():
+                    return f"Error: File does not exist: {file_path}"
+                
+                if not file_path.is_file():
+                    return f"Error: Path is not a file: {file_path}"
+                
+                # Read the file with line numbers
+                try:
+                    with open(file_path, 'r', encoding='utf-8') as f:
+                        lines = f.readlines()
+                    
+                    total_lines = len(lines)
+                    end_line = min(start_line + max_lines - 1, total_lines)
+                    
+                    # Extract requested lines
+                    if start_line > total_lines:
+                        return f"Error: start_line {start_line} exceeds file length ({total_lines} lines)"
+                    
+                    selected_lines = lines[start_line-1:end_line]
+                    
+                    # Format output with line numbers
+                    output = []
+                    output.append(f"=== File: {file_path} ===")
+                    output.append(f"Lines {start_line}-{end_line} of {total_lines} total lines")
+                    output.append("-" * 50)
+                    
+                    for i, line in enumerate(selected_lines, start=start_line):
+                        # Remove trailing newline for display
+                        output.append(f"{i:6d} | {line.rstrip()}")
+                    
+                    if end_line < total_lines:
+                        output.append("-" * 50)
+                        output.append(f"... {total_lines - end_line} more lines. Use start_line={end_line + 1} to continue reading.")
+                    
+                    return "\n".join(output)
+                    
+                except UnicodeDecodeError:
+                    return f"Error: File appears to be binary or has encoding issues: {file_path}"
+                except Exception as e:
+                    return f"Error reading file: {str(e)}"
+                    
+            except Exception as e:
+                error_msg = f"Error in read_file: {str(e)}"
+                logger.error(error_msg, exc_info=True)
+                return error_msg
+        
+        elif tool_name == "write_file":
+            path = arguments["path"]
+            content = arguments["content"]
+            mode = arguments.get("mode", "write")
+            
+            try:
+                # Resolve path relative to current directory
+                if not Path(path).is_absolute():
+                    # Get current directory from shell
+                    pwd_result = self.shell.execute_command("pwd", 2)
+                    current_dir = pwd_result.strip()
+                    if current_dir and current_dir.startswith('/'):
+                        file_path = Path(current_dir) / path
+                    else:
+                        file_path = Path(path)
+                else:
+                    file_path = Path(path)
+                
+                # Create parent directories if needed
+                file_path.parent.mkdir(parents=True, exist_ok=True)
+                
+                # Write the file
+                write_mode = 'a' if mode == 'append' else 'w'
+                with open(file_path, write_mode, encoding='utf-8') as f:
+                    f.write(content)
+                    if not content.endswith('\n'):
+                        f.write('\n')  # Ensure file ends with newline
+                
+                # Get file info for confirmation
+                stat_info = file_path.stat()
+                file_size = stat_info.st_size
+                
+                # Count lines for feedback
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    line_count = sum(1 for _ in f)
+                
+                action = "Appended to" if mode == 'append' else "Wrote"
+                return f"{action} file: {file_path}\nFile size: {file_size} bytes\nTotal lines: {line_count}"
+                
+            except Exception as e:
+                error_msg = f"Error in write_file: {str(e)}"
                 logger.error(error_msg, exc_info=True)
                 return error_msg
         
@@ -422,9 +576,18 @@ class ConversationManager:
                             # Execute the tool
                             tool_result = await self.execute_mcp_tool(content_block.name, content_block.input)
                             
-                            # Format the tool use and result nicely
-                            command = content_block.input.get('command', 'Unknown command')
-                            full_response += f"\n\n**Executed Command:**\n```bash\n{command}\n```\n\n**Output:**\n```\n{tool_result}\n```\n"
+                            # Format the tool use and result nicely based on tool type
+                            if content_block.name == "run_command":
+                                command = content_block.input.get('command', 'Unknown command')
+                                full_response += f"\n\n**Executed Command:**\n```bash\n{command}\n```\n\n**Output:**\n```\n{tool_result}\n```\n"
+                            elif content_block.name == "read_file":
+                                path = content_block.input.get('path', 'Unknown file')
+                                full_response += f"\n\n**Read File: {path}**\n```\n{tool_result}\n```\n"
+                            elif content_block.name == "write_file":
+                                path = content_block.input.get('path', 'Unknown file')
+                                full_response += f"\n\n**Write File: {path}**\n{tool_result}\n"
+                            else:
+                                full_response += f"\n\n**Tool Use: {content_block.name}**\n```\n{tool_result}\n```\n"
                     else:
                         # Handle cases where content_block might be a string
                         full_response += str(content_block)
