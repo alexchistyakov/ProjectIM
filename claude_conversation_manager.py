@@ -147,11 +147,14 @@ class PersistentShell:
         marker_found = False
         exit_code = None
         
+        # Increase buffer size for larger outputs
+        buffer_size = 65536  # 64KB instead of 4KB
+        
         while time.time() - start_time < timeout:
             ready, _, _ = select.select([self.master], [], [], 0.1)
             if ready:
                 try:
-                    chunk = os.read(self.master, 4096).decode('utf-8', errors='replace')
+                    chunk = os.read(self.master, buffer_size).decode('utf-8', errors='replace')
                     
                     # Look for our marker
                     if marker in chunk:
@@ -164,6 +167,22 @@ class PersistentShell:
                             exit_code_part = parts[1].split('\n')[0].strip()
                             if exit_code_part.isdigit():
                                 exit_code = int(exit_code_part)
+                        
+                        # For git operations, collect any remaining output
+                        if 'git' in command:
+                            # Give it a bit more time to collect remaining output
+                            end_time = time.time() + 0.5
+                            while time.time() < end_time:
+                                ready, _, _ = select.select([self.master], [], [], 0.05)
+                                if ready:
+                                    try:
+                                        extra_chunk = os.read(self.master, buffer_size).decode('utf-8', errors='replace')
+                                        if extra_chunk and marker not in extra_chunk:
+                                            output.append(extra_chunk)
+                                    except OSError:
+                                        break
+                                else:
+                                    break
                         break
                     else:
                         output.append(chunk)
@@ -178,7 +197,9 @@ class PersistentShell:
                     return "Shell process terminated"
         
         if not marker_found:
-            return f"Command timed out after {timeout} seconds"
+            # For long-running commands, return partial output with timeout message
+            partial_output = ''.join(output)
+            return f"{partial_output}\n\n[Command timed out after {timeout} seconds]"
             
         # Join output and clean it up
         result = ''.join(output)
@@ -412,22 +433,53 @@ class ConversationManager:
                 if repo_path != ".":
                     self.shell.execute_command(f"cd {repo_path}", 5)
                 
-                # Test SSH connection first
-                ssh_test = self.shell.execute_command("ssh-add -l", 5)
+                # Check if we're on a DigitalOcean droplet and need to set up SSH
+                is_droplet = self.shell.execute_command("test -f /etc/digitalocean && echo 'yes' || echo 'no'", 2).strip()
+                
+                if is_droplet == "yes":
+                    # On DigitalOcean droplets, SSH agent might not be set up
+                    # Check if we need to start SSH agent
+                    ssh_check = self.shell.execute_command("echo $SSH_AUTH_SOCK", 2).strip()
+                    if not ssh_check or ssh_check == "SSH_AUTH_SOCK=":
+                        logger.info("Starting SSH agent on DigitalOcean droplet")
+                        # Start SSH agent and add keys
+                        self.shell.execute_command("eval $(ssh-agent -s)", 2)
+                        # Try to add default SSH key
+                        self.shell.execute_command("ssh-add ~/.ssh/id_rsa 2>/dev/null || ssh-add ~/.ssh/id_ed25519 2>/dev/null || true", 5)
+                
+                # Test SSH connection
+                ssh_test = self.shell.execute_command("ssh-add -l 2>&1", 5)
                 logger.info(f"SSH agent test: {ssh_test}")
+                
+                # If no keys loaded, try to load them
+                if "has no identities" in ssh_test or "Could not open" in ssh_test:
+                    logger.warning("No SSH keys loaded, attempting to load default keys")
+                    # Try to load common key types
+                    key_load = self.shell.execute_command(
+                        "ssh-add ~/.ssh/id_rsa 2>/dev/null || "
+                        "ssh-add ~/.ssh/id_ed25519 2>/dev/null || "
+                        "ssh-add ~/.ssh/id_ecdsa 2>/dev/null || "
+                        "echo 'No SSH keys found'", 10
+                    )
+                    logger.info(f"Key load result: {key_load}")
                 
                 # Build git command
                 git_command = f"git {operation}"
                 if args:
                     git_command += f" {args}"
                 
-                # For push/pull operations, use verbose mode and show progress
-                if operation in ['push', 'pull', 'fetch']:
-                    if '-v' not in args:
-                        git_command += " -v"
-                    timeout = 60  # Longer timeout for network operations
+                # For push/pull operations, use verbose mode and capture stderr
+                if operation in ['push', 'pull', 'fetch', 'clone']:
+                    # Redirect stderr to stdout to capture all output
+                    git_command = f"{git_command} 2>&1"
+                    if operation == 'push' and '-v' not in args:
+                        # Remove the 2>&1 we just added and add it after -v
+                        git_command = f"git {operation} {args} -v 2>&1"
+                    timeout = 120  # Longer timeout for network operations
                 else:
                     timeout = 30
+                
+                logger.info(f"Executing git command: {git_command}")
                 
                 # Execute git command
                 output = self.shell.execute_command(git_command, timeout)
@@ -435,11 +487,40 @@ class ConversationManager:
                 # Check if we need to handle SSH key issues
                 if "Permission denied" in output or "Could not read from remote repository" in output:
                     # Try to diagnose SSH issues
-                    ssh_debug = self.shell.execute_command("ssh -T git@github.com", 10)
-                    return f"Git operation failed - SSH authentication issue:\n{output}\n\nSSH Test:\n{ssh_debug}\n\nMake sure your SSH agent is running and has your keys loaded."
+                    ssh_debug = self.shell.execute_command("ssh -T git@github.com 2>&1", 10)
+                    
+                    # Additional diagnostics for DigitalOcean
+                    diagnostics = [
+                        f"Git operation failed - SSH authentication issue:\n{output}",
+                        f"\nSSH Test:\n{ssh_debug}",
+                        "\nDiagnostics:"
+                    ]
+                    
+                    # Check SSH agent
+                    agent_status = self.shell.execute_command("ssh-add -l 2>&1", 5)
+                    diagnostics.append(f"SSH Agent Status: {agent_status}")
+                    
+                    # Check for SSH keys
+                    key_check = self.shell.execute_command("ls -la ~/.ssh/*.pub 2>/dev/null | head -5", 5)
+                    diagnostics.append(f"Available SSH Keys:\n{key_check}")
+                    
+                    # Check git remote
+                    remote_check = self.shell.execute_command("git remote -v", 5)
+                    diagnostics.append(f"Git Remote:\n{remote_check}")
+                    
+                    return "\n".join(diagnostics) + "\n\nTo fix: Ensure SSH keys are added to GitHub and ssh-agent is running with keys loaded."
+                
+                # For successful operations, format output nicely
+                if operation == "push" and "Everything up-to-date" not in output and "[Exit code: 0]" not in output:
+                    # Git push was successful if we see certain patterns
+                    success_indicators = ["->", "Total", "Writing objects: 100%", "remote:", "To "]
+                    if any(indicator in output for indicator in success_indicators):
+                        return f"Git {operation} completed successfully:\n{output}"
                 
                 return f"Git {operation} result:\n{output}"
+                
             except Exception as e:
+                logger.error(f"Error in git_operation: {str(e)}", exc_info=True)
                 return f"Error executing git operation: {str(e)}"
         
         elif tool_name == "check_ssh_config":
