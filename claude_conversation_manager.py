@@ -41,101 +41,155 @@ class PersistentShell:
     """Maintains a persistent shell session"""
     
     def __init__(self, working_dir: str = None):
-        self.master, self.slave = pty.openpty()
-        self.shell = subprocess.Popen(
-            ['/bin/bash', '-i'],  # Interactive bash shell
-            stdin=self.slave,
-            stdout=self.slave,
-            stderr=self.slave,
-            cwd=working_dir,
-            env={**os.environ, 'PS1': '\\$ ', 'PS2': '> '},  # Simple prompts
-            universal_newlines=False,
-            preexec_fn=os.setsid  # Create new session
-        )
-        os.close(self.slave)
-        self.current_dir = working_dir or os.getcwd()
-        # Wait for shell to be ready
-        time.sleep(0.1)
-        self._clear_initial_output()
+        # Create a pseudo-terminal
+        self.master, slave = pty.openpty()
         
-    def _clear_initial_output(self):
-        """Clear any initial shell output"""
-        # Set non-blocking mode
+        # Set up environment with minimal prompt to avoid issues
+        env = os.environ.copy()
+        env['PS1'] = '$ '  # Simple prompt without backslash escaping
+        env['PS2'] = '> '
+        env['TERM'] = 'dumb'  # Avoid terminal control sequences
+        
+        # Start bash in non-interactive mode initially
+        self.shell = subprocess.Popen(
+            ['/bin/bash', '--norc', '--noprofile'],  # Skip RC files
+            stdin=slave,
+            stdout=slave,
+            stderr=slave,
+            cwd=working_dir,
+            env=env,
+            universal_newlines=False,
+            preexec_fn=os.setsid
+        )
+        os.close(slave)
+        self.current_dir = working_dir or os.getcwd()
+        
+        # Set up the prompt explicitly
+        self._setup_shell()
+        
+    def _setup_shell(self):
+        """Setup the shell with proper prompt"""
+        # Send commands to set up the shell
+        setup_commands = [
+            "PS1='$ '",  # Set simple prompt
+            "PS2='> '",
+            "set +o history",  # Disable history expansion
+            "stty -echo",  # Disable echo to avoid seeing commands twice
+        ]
+        
+        for cmd in setup_commands:
+            os.write(self.master, (cmd + '\n').encode())
+            time.sleep(0.1)
+        
+        # Clear any output from setup
+        self._clear_output(timeout=0.5)
+        
+    def _clear_output(self, timeout=0.5):
+        """Clear any pending output from the shell"""
         import fcntl
+        
+        # Set non-blocking mode
         flags = fcntl.fcntl(self.master, fcntl.F_GETFL)
         fcntl.fcntl(self.master, fcntl.F_SETFL, flags | os.O_NONBLOCK)
         
-        # Read and discard initial output
-        try:
-            while True:
+        start_time = time.time()
+        while time.time() - start_time < timeout:
+            try:
                 ready, _, _ = select.select([self.master], [], [], 0.1)
                 if ready:
-                    os.read(self.master, 1024)
+                    os.read(self.master, 4096)
                 else:
                     break
-        except:
-            pass
-            
-        # Set back to blocking mode
+            except OSError:
+                break
+                
+        # Restore blocking mode
         fcntl.fcntl(self.master, fcntl.F_SETFL, flags)
         
     def execute_command(self, command: str, timeout: int = 30) -> str:
         """Execute a command in the persistent shell"""
-        # Send command
-        os.write(self.master, (command + '\n').encode())
+        # Clear any pending output first
+        self._clear_output(timeout=0.1)
         
-        # Read output with timeout
+        # Send command with unique marker
+        marker = f"__MARKER_{int(time.time()*1000)}__"
+        full_command = f"{command}; echo {marker}$?"
+        os.write(self.master, (full_command + '\n').encode())
+        
+        # Read output
         output = []
         start_time = time.time()
-        command_echo_skipped = False
+        marker_found = False
+        exit_code = None
         
-        while True:
-            if time.time() - start_time > timeout:
-                return "Command timed out"
-                
+        while time.time() - start_time < timeout:
             ready, _, _ = select.select([self.master], [], [], 0.1)
             if ready:
                 try:
-                    data = os.read(self.master, 1024).decode('utf-8', errors='replace')
+                    chunk = os.read(self.master, 4096).decode('utf-8', errors='replace')
                     
-                    # Skip the command echo (first line)
-                    if not command_echo_skipped and command in data:
-                        lines = data.split('\n')
-                        for i, line in enumerate(lines):
-                            if command in line:
-                                data = '\n'.join(lines[i+1:])
-                                command_echo_skipped = True
-                                break
-                    
-                    output.append(data)
-                    
-                    # Check if command completed (look for prompt)
-                    if data.endswith('$ ') or data.endswith('> '):
-                        # Remove the prompt from output
-                        result = ''.join(output)
-                        if result.endswith('$ '):
-                            result = result[:-2]
-                        elif result.endswith('> '):
-                            result = result[:-2]
-                        return result.strip()
-                except OSError:
-                    break
+                    # Look for our marker
+                    if marker in chunk:
+                        marker_found = True
+                        # Extract exit code and output before marker
+                        parts = chunk.split(marker)
+                        if len(parts) >= 2:
+                            output.append(parts[0])
+                            # Try to extract exit code
+                            exit_code_part = parts[1].split('\n')[0].strip()
+                            if exit_code_part.isdigit():
+                                exit_code = int(exit_code_part)
+                        break
+                    else:
+                        output.append(chunk)
+                        
+                except OSError as e:
+                    if e.errno == 5:  # Input/output error
+                        return "Shell process terminated"
+                    raise
             else:
-                # No data available, check if process is still alive
+                # Check if process is still alive
                 if self.shell.poll() is not None:
                     return "Shell process terminated"
-                    
-        return ''.join(output).strip()
+        
+        if not marker_found:
+            return f"Command timed out after {timeout} seconds"
+            
+        # Join output and clean it up
+        result = ''.join(output)
+        
+        # Remove the command echo if present
+        lines = result.split('\n')
+        if lines and command in lines[0]:
+            lines = lines[1:]
+        result = '\n'.join(lines).strip()
+        
+        # Add exit code info if command failed
+        if exit_code and exit_code != 0:
+            result += f"\n[Exit code: {exit_code}]"
+            
+        return result
     
     def close(self):
         """Close the shell session"""
-        if self.shell.poll() is None:
-            self.shell.terminate()
-            self.shell.wait()
-        try:
-            os.close(self.master)
-        except:
-            pass
+        if hasattr(self, 'shell') and self.shell.poll() is None:
+            try:
+                # Send exit command
+                os.write(self.master, b'exit\n')
+                time.sleep(0.1)
+            except:
+                pass
+            
+            # Terminate if still running
+            if self.shell.poll() is None:
+                self.shell.terminate()
+                self.shell.wait()
+                
+        if hasattr(self, 'master'):
+            try:
+                os.close(self.master)
+            except:
+                pass
 
 @dataclass
 class Message:
