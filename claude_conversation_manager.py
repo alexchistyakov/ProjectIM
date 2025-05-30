@@ -381,9 +381,21 @@ class ConversationManager:
         elif tool_name == "read_file":
             path = arguments["path"]
             try:
+                # Ensure we're using absolute paths
+                if not Path(path).is_absolute():
+                    # Convert to absolute path based on project directory
+                    abs_path = project_dir / path
+                else:
+                    abs_path = Path(path)
+                
                 # Use cat command in the persistent shell
-                output = self.shell.execute_command(f"cat {path}", 10)
-                return f"File contents of {path}:\n{output}"
+                output = self.shell.execute_command(f"cat '{abs_path}'", 10)
+                
+                # Check if file exists
+                if "[Exit code:" in output and "[Exit code: 0]" not in output:
+                    return f"Error reading file {abs_path}: File may not exist\n{output}"
+                
+                return f"File contents of {abs_path}:\n{output}"
             except Exception as e:
                 return f"Error reading file: {str(e)}"
         
@@ -392,26 +404,37 @@ class ConversationManager:
             content = arguments["content"]
             append = arguments.get("append", False)
             try:
-                # Escape content for shell
-                escaped_content = content.replace("'", "'\"'\"'")
+                # Ensure we're using absolute paths
+                if not Path(path).is_absolute():
+                    # Convert to absolute path based on project directory
+                    abs_path = project_dir / path
+                else:
+                    abs_path = Path(path)
+                
+                # Escape content for shell - handle single quotes properly
+                escaped_content = content.replace("\\", "\\\\").replace("'", "'\"'\"'")
                 
                 # Create parent directory if needed
-                parent_dir = Path(path).parent
-                if parent_dir != Path('.'):
-                    self.shell.execute_command(f"mkdir -p {parent_dir}", 5)
+                parent_dir = abs_path.parent
+                if not parent_dir.exists():
+                    self.shell.execute_command(f"mkdir -p '{parent_dir}'", 5)
                 
-                # Write file using echo or cat
+                # Write file using echo or printf for better reliability
+                # Using printf to handle newlines and special characters better
                 if append:
-                    command = f"echo '{escaped_content}' >> {path}"
+                    command = f"printf '%s\\n' '{escaped_content}' >> '{abs_path}'"
                 else:
-                    command = f"echo '{escaped_content}' > {path}"
+                    command = f"printf '%s\\n' '{escaped_content}' > '{abs_path}'"
                 
                 output = self.shell.execute_command(command, 10)
                 
                 # Verify file was written
-                verify_output = self.shell.execute_command(f"ls -la {path}", 5)
+                verify_output = self.shell.execute_command(f"ls -la '{abs_path}'", 5)
                 
-                return f"Wrote to {path}\nVerification:\n{verify_output}"
+                # Also show the actual path where the file was created
+                pwd_output = self.shell.execute_command("pwd", 2)
+                
+                return f"Wrote to {abs_path}\nCurrent directory: {pwd_output}\nVerification:\n{verify_output}"
             except Exception as e:
                 return f"Error writing file: {str(e)}"
         
