@@ -20,8 +20,14 @@ import logging
 from pathlib import Path
 
 # Configure logging
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
+
+# Set to DEBUG for troubleshooting
+# logger.setLevel(logging.DEBUG)
 
 console = Console()
 
@@ -268,19 +274,44 @@ class ConversationManager:
                     max_tokens=1024
                 )
             
-            # Handle tool use
+            # Log the response structure for debugging
+            logger.debug(f"Response type: {type(response)}")
+            logger.debug(f"Response attributes: {dir(response)}")
+            
+            # Handle tool use - the response structure is a Message object
             full_response = ""
-            for content in response.content:
-                if content.type == "text":
-                    full_response += content.text
-                elif content.type == "tool_use":
-                    tool_result = await self.execute_mcp_tool(content.name, content.input)
-                    full_response += f"\n\n**Tool Use:** {content.name}\n**Result:**\n```\n{tool_result}\n```\n"
+            
+            # Check if response has content attribute
+            if hasattr(response, 'content'):
+                for content_block in response.content:
+                    if hasattr(content_block, 'type'):
+                        if content_block.type == "text":
+                            full_response += content_block.text
+                        elif content_block.type == "tool_use":
+                            # Execute the tool
+                            tool_result = await self.execute_mcp_tool(content_block.name, content_block.input)
+                            full_response += f"\n\n**Tool Use:** {content_block.name}\n**Result:**\n```\n{tool_result}\n```\n"
+                    else:
+                        # Handle cases where content_block might be a string
+                        full_response += str(content_block)
+            else:
+                # Fallback for different response structures
+                logger.warning(f"Unexpected response structure: {response}")
+                full_response = str(response)
+            
+            # If we got no response, return a default message
+            if not full_response:
+                full_response = "I apologize, but I couldn't generate a proper response."
             
             return full_response
             
+        except AttributeError as e:
+            logger.error(f"AttributeError in get_claude_response: {str(e)}")
+            logger.error(f"Response object: {response if 'response' in locals() else 'No response object'}")
+            return f"Error accessing response attributes: {str(e)}"
         except Exception as e:
             logger.error(f"Error getting Claude response: {str(e)}")
+            logger.error(f"Error type: {type(e).__name__}")
             return f"Error: {str(e)}"
     
     async def run_conversation(self, num_exchanges: Optional[int] = None):
