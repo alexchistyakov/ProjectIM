@@ -44,15 +44,34 @@ class PersistentShell:
         # Create a pseudo-terminal
         self.master, slave = pty.openpty()
         
-        # Set up environment with minimal prompt to avoid issues
+        # Set up environment - preserve the full environment to keep SSH agent access
         env = os.environ.copy()
+        
+        # Ensure SSH-related variables are preserved
+        ssh_vars = ['SSH_AUTH_SOCK', 'SSH_AGENT_PID', 'SSH_CONNECTION', 'SSH_CLIENT']
+        for var in ssh_vars:
+            if var in os.environ:
+                env[var] = os.environ[var]
+        
+        # Also preserve Git-related variables
+        git_vars = ['GIT_SSH', 'GIT_SSH_COMMAND', 'GIT_ASKPASS']
+        for var in git_vars:
+            if var in os.environ:
+                env[var] = os.environ[var]
+        
+        # Preserve HOME to ensure access to .ssh directory
+        if 'HOME' in os.environ:
+            env['HOME'] = os.environ['HOME']
+            
+        # Set minimal prompt to avoid issues
         env['PS1'] = '$ '  # Simple prompt without backslash escaping
         env['PS2'] = '> '
         env['TERM'] = 'dumb'  # Avoid terminal control sequences
         
-        # Start bash in non-interactive mode initially
+        # Start bash with the user's profile to ensure proper initialization
+        # Use --login to source profile files and get the full user environment
         self.shell = subprocess.Popen(
-            ['/bin/bash', '--norc', '--noprofile'],  # Skip RC files
+            ['/bin/bash', '--login'],  # Use login shell to get full environment
             stdin=slave,
             stdout=slave,
             stderr=slave,
@@ -67,6 +86,10 @@ class PersistentShell:
         # Set up the prompt explicitly
         self._setup_shell()
         
+        # Log SSH agent status for debugging
+        logger.info(f"SSH_AUTH_SOCK: {env.get('SSH_AUTH_SOCK', 'Not set')}")
+        logger.info(f"HOME: {env.get('HOME', 'Not set')}")
+        
     def _setup_shell(self):
         """Setup the shell with proper prompt"""
         # Send commands to set up the shell
@@ -75,6 +98,8 @@ class PersistentShell:
             "PS2='> '",
             "set +o history",  # Disable history expansion
             "stty -echo",  # Disable echo to avoid seeing commands twice
+            # Test SSH agent connection
+            "ssh-add -l > /dev/null 2>&1 && echo 'SSH agent available' || echo 'SSH agent not available'"
         ]
         
         for cmd in setup_commands:
@@ -261,6 +286,41 @@ class ConversationManager:
                 }
             },
             {
+                "name": "git_operation",
+                "description": "Execute Git operations with proper SSH authentication",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "operation": {
+                            "type": "string",
+                            "description": "Git operation (e.g., 'push', 'pull', 'clone', 'commit', 'add')"
+                        },
+                        "args": {
+                            "type": "string",
+                            "description": "Additional arguments for the git command"
+                        },
+                        "repo_path": {
+                            "type": "string",
+                            "description": "Path to the repository (optional, uses current directory if not specified)"
+                        }
+                    },
+                    "required": ["operation"]
+                }
+            },
+            {
+                "name": "check_ssh_config",
+                "description": "Check SSH configuration and agent status",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "test_github": {
+                            "type": "boolean",
+                            "description": "Test connection to GitHub (default: true)"
+                        }
+                    }
+                }
+            },
+            {
                 "name": "change_directory",
                 "description": "Change the current working directory",
                 "input_schema": {
@@ -341,6 +401,99 @@ class ConversationManager:
                 return f"Command: {command}\nOutput:\n{output}"
             except Exception as e:
                 return f"Error executing command: {str(e)}"
+        
+        elif tool_name == "git_operation":
+            operation = arguments["operation"]
+            args = arguments.get("args", "")
+            repo_path = arguments.get("repo_path", ".")
+            
+            try:
+                # Change to repo directory if specified
+                if repo_path != ".":
+                    self.shell.execute_command(f"cd {repo_path}", 5)
+                
+                # Test SSH connection first
+                ssh_test = self.shell.execute_command("ssh-add -l", 5)
+                logger.info(f"SSH agent test: {ssh_test}")
+                
+                # Build git command
+                git_command = f"git {operation}"
+                if args:
+                    git_command += f" {args}"
+                
+                # For push/pull operations, use verbose mode and show progress
+                if operation in ['push', 'pull', 'fetch']:
+                    if '-v' not in args:
+                        git_command += " -v"
+                    timeout = 60  # Longer timeout for network operations
+                else:
+                    timeout = 30
+                
+                # Execute git command
+                output = self.shell.execute_command(git_command, timeout)
+                
+                # Check if we need to handle SSH key issues
+                if "Permission denied" in output or "Could not read from remote repository" in output:
+                    # Try to diagnose SSH issues
+                    ssh_debug = self.shell.execute_command("ssh -T git@github.com", 10)
+                    return f"Git operation failed - SSH authentication issue:\n{output}\n\nSSH Test:\n{ssh_debug}\n\nMake sure your SSH agent is running and has your keys loaded."
+                
+                return f"Git {operation} result:\n{output}"
+            except Exception as e:
+                return f"Error executing git operation: {str(e)}"
+        
+        elif tool_name == "check_ssh_config":
+            test_github = arguments.get("test_github", True)
+            try:
+                results = []
+                
+                # Check if SSH agent is running
+                agent_check = self.shell.execute_command("ssh-add -l", 5)
+                if "Could not open a connection" in agent_check or "Error" in agent_check:
+                    results.append("❌ SSH Agent: Not running or not accessible")
+                    
+                    # Try to start SSH agent
+                    start_agent = self.shell.execute_command("eval $(ssh-agent -s) && ssh-add -l", 5)
+                    results.append(f"Attempted to start SSH agent: {start_agent}")
+                else:
+                    results.append(f"✅ SSH Agent: Running\nKeys loaded:\n{agent_check}")
+                
+                # Check SSH config file
+                ssh_config_check = self.shell.execute_command("ls -la ~/.ssh/config 2>/dev/null", 5)
+                if "[Exit code:" not in ssh_config_check or "[Exit code: 0]" in ssh_config_check:
+                    results.append(f"✅ SSH Config: Found\n{ssh_config_check}")
+                else:
+                    results.append("ℹ️  SSH Config: Not found (optional)")
+                
+                # List available SSH keys
+                keys_check = self.shell.execute_command("ls -la ~/.ssh/*.pub 2>/dev/null", 5)
+                if "[Exit code:" not in keys_check or "[Exit code: 0]" in keys_check:
+                    results.append(f"✅ SSH Keys found:\n{keys_check}")
+                else:
+                    results.append("❌ No SSH public keys found in ~/.ssh/")
+                
+                # Check environment variables
+                env_check = self.shell.execute_command("echo 'SSH_AUTH_SOCK='$SSH_AUTH_SOCK", 5)
+                results.append(f"Environment: {env_check}")
+                
+                # Test GitHub connection if requested
+                if test_github:
+                    results.append("\nTesting GitHub SSH connection...")
+                    github_test = self.shell.execute_command("ssh -T git@github.com 2>&1", 10)
+                    
+                    if "successfully authenticated" in github_test.lower():
+                        results.append(f"✅ GitHub SSH: {github_test}")
+                    else:
+                        results.append(f"❌ GitHub SSH: {github_test}")
+                        
+                        # Additional diagnostics
+                        results.append("\nDebug info:")
+                        debug_info = self.shell.execute_command("ssh -vT git@github.com 2>&1 | grep -E '(Offering|Trying|Authentications|Permission)'", 10)
+                        results.append(debug_info)
+                
+                return "\n".join(results)
+            except Exception as e:
+                return f"Error checking SSH configuration: {str(e)}"
         
         elif tool_name == "change_directory":
             path = arguments["path"]
