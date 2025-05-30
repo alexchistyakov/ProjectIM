@@ -18,6 +18,12 @@ from rich.text import Text
 from rich.markdown import Markdown
 import logging
 from pathlib import Path
+import subprocess
+import pty
+import select
+import termios
+import tty
+import time
 
 # Configure logging
 logging.basicConfig(
@@ -30,6 +36,106 @@ logger = logging.getLogger(__name__)
 # logger.setLevel(logging.DEBUG)
 
 console = Console()
+
+class PersistentShell:
+    """Maintains a persistent shell session"""
+    
+    def __init__(self, working_dir: str = None):
+        self.master, self.slave = pty.openpty()
+        self.shell = subprocess.Popen(
+            ['/bin/bash', '-i'],  # Interactive bash shell
+            stdin=self.slave,
+            stdout=self.slave,
+            stderr=self.slave,
+            cwd=working_dir,
+            env={**os.environ, 'PS1': '\\$ ', 'PS2': '> '},  # Simple prompts
+            universal_newlines=False,
+            preexec_fn=os.setsid  # Create new session
+        )
+        os.close(self.slave)
+        self.current_dir = working_dir or os.getcwd()
+        # Wait for shell to be ready
+        time.sleep(0.1)
+        self._clear_initial_output()
+        
+    def _clear_initial_output(self):
+        """Clear any initial shell output"""
+        # Set non-blocking mode
+        import fcntl
+        flags = fcntl.fcntl(self.master, fcntl.F_GETFL)
+        fcntl.fcntl(self.master, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+        
+        # Read and discard initial output
+        try:
+            while True:
+                ready, _, _ = select.select([self.master], [], [], 0.1)
+                if ready:
+                    os.read(self.master, 1024)
+                else:
+                    break
+        except:
+            pass
+            
+        # Set back to blocking mode
+        fcntl.fcntl(self.master, fcntl.F_SETFL, flags)
+        
+    def execute_command(self, command: str, timeout: int = 30) -> str:
+        """Execute a command in the persistent shell"""
+        # Send command
+        os.write(self.master, (command + '\n').encode())
+        
+        # Read output with timeout
+        output = []
+        start_time = time.time()
+        command_echo_skipped = False
+        
+        while True:
+            if time.time() - start_time > timeout:
+                return "Command timed out"
+                
+            ready, _, _ = select.select([self.master], [], [], 0.1)
+            if ready:
+                try:
+                    data = os.read(self.master, 1024).decode('utf-8', errors='replace')
+                    
+                    # Skip the command echo (first line)
+                    if not command_echo_skipped and command in data:
+                        lines = data.split('\n')
+                        for i, line in enumerate(lines):
+                            if command in line:
+                                data = '\n'.join(lines[i+1:])
+                                command_echo_skipped = True
+                                break
+                    
+                    output.append(data)
+                    
+                    # Check if command completed (look for prompt)
+                    if data.endswith('$ ') or data.endswith('> '):
+                        # Remove the prompt from output
+                        result = ''.join(output)
+                        if result.endswith('$ '):
+                            result = result[:-2]
+                        elif result.endswith('> '):
+                            result = result[:-2]
+                        return result.strip()
+                except OSError:
+                    break
+            else:
+                # No data available, check if process is still alive
+                if self.shell.poll() is not None:
+                    return "Shell process terminated"
+                    
+        return ''.join(output).strip()
+    
+    def close(self):
+        """Close the shell session"""
+        if self.shell.poll() is None:
+            self.shell.terminate()
+            self.shell.wait()
+        try:
+            os.close(self.master)
+        except:
+            pass
 
 @dataclass
 class Message:
@@ -62,6 +168,18 @@ class ConversationManager:
         self.pause_event = asyncio.Event()
         self.pause_event.set()  # Start unpaused
         self.mcp_tools = self._get_mcp_tools()
+        
+        # Initialize persistent shell
+        project_dir = Path(__file__).parent.absolute()
+        self.shell = PersistentShell(str(project_dir))
+        self.current_dir = str(project_dir)
+        logger.info(f"Initialized persistent shell in {self.current_dir}")
+        
+    def __del__(self):
+        """Cleanup shell on deletion"""
+        if hasattr(self, 'shell'):
+            self.shell.close()
+            logger.info("Closed persistent shell")
         
     def _get_mcp_tools(self) -> List[Dict[str, Any]]:
         """Get MCP tools definition for Claude"""
@@ -154,73 +272,64 @@ class ConversationManager:
         ]
     
     async def execute_mcp_tool(self, tool_name: str, arguments: Dict[str, Any]) -> str:
-        """Execute an MCP tool by calling the MCP server"""
-        # This is a simplified version - in production, you'd connect to the MCP server
-        # For now, we'll execute commands directly
-        import subprocess
+        """Execute an MCP tool using the persistent shell"""
         
         # Get the project directory (where this script is located)
         project_dir = Path(__file__).parent.absolute()
         
         if tool_name == "execute_command":
             command = arguments["command"]
-            working_dir = arguments.get("working_dir", str(project_dir))
             timeout = arguments.get("timeout", 30)
             
             try:
-                result = subprocess.run(
-                    command,
-                    shell=True,
-                    cwd=working_dir,
-                    capture_output=True,
-                    text=True,
-                    timeout=timeout
-                )
-                return f"Exit code: {result.returncode}\nWorkingDir: {working_dir}\nSTDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
-            except subprocess.TimeoutExpired:
-                return f"Command timed out after {timeout} seconds"
+                # Execute in persistent shell
+                output = self.shell.execute_command(command, timeout)
+                return f"Command: {command}\nOutput:\n{output}"
             except Exception as e:
                 return f"Error executing command: {str(e)}"
         
         elif tool_name == "change_directory":
             path = arguments["path"]
             try:
-                # Convert relative paths to absolute paths based on project directory
+                # Convert relative paths to absolute paths based on current directory
                 if not Path(path).is_absolute():
-                    path = project_dir / path
+                    path = Path(self.current_dir) / path
+                    
+                # Change directory in persistent shell
+                output = self.shell.execute_command(f"cd {path} && pwd", 5)
                 
-                os.chdir(path)
-                return f"Successfully changed directory to {path}"
+                # Check if successful
+                if "No such file or directory" not in output and "not found" not in output:
+                    # Update current directory
+                    pwd_output = output.strip()
+                    if pwd_output and pwd_output.startswith('/'):
+                        self.current_dir = pwd_output
+                    return f"Changed directory to {self.current_dir}"
+                else:
+                    return f"Error: {output}"
             except Exception as e:
                 return f"Error changing directory: {str(e)}"
         
         elif tool_name == "list_directory":
-            path = arguments.get("path", str(project_dir))
+            path = arguments.get("path", ".")
             try:
-                # Convert relative paths to absolute paths based on project directory
-                if not Path(path).is_absolute():
-                    path = project_dir / path
-                
-                items = []
-                for item in sorted(Path(path).iterdir()):
-                    if item.is_dir():
-                        items.append(f"[DIR]  {item.name}")
-                    else:
-                        items.append(f"[FILE] {item.name}")
-                return f"Directory: {path}\n" + "\n".join(items)
+                # Use ls command in the persistent shell
+                if path == ".":
+                    command = "ls -la"
+                else:
+                    command = f"ls -la {path}"
+                    
+                output = self.shell.execute_command(command, 5)
+                return f"Directory listing:\n{output}"
             except Exception as e:
                 return f"Error listing directory: {str(e)}"
         
         elif tool_name == "read_file":
             path = arguments["path"]
             try:
-                # Convert relative paths to absolute paths based on project directory
-                if not Path(path).is_absolute():
-                    path = project_dir / path
-                    
-                with open(path, 'r') as f:
-                    content = f.read()
-                return f"File: {path}\n{content}"
+                # Use cat command in the persistent shell
+                output = self.shell.execute_command(f"cat {path}", 10)
+                return f"File contents of {path}:\n{output}"
             except Exception as e:
                 return f"Error reading file: {str(e)}"
         
@@ -229,17 +338,26 @@ class ConversationManager:
             content = arguments["content"]
             append = arguments.get("append", False)
             try:
-                # Convert relative paths to absolute paths based on project directory
-                if not Path(path).is_absolute():
-                    path = project_dir / path
+                # Escape content for shell
+                escaped_content = content.replace("'", "'\"'\"'")
                 
-                # Ensure parent directory exists
-                Path(path).parent.mkdir(parents=True, exist_ok=True)
+                # Create parent directory if needed
+                parent_dir = Path(path).parent
+                if parent_dir != Path('.'):
+                    self.shell.execute_command(f"mkdir -p {parent_dir}", 5)
                 
-                mode = 'a' if append else 'w'
-                with open(path, mode) as f:
-                    f.write(content)
-                return f"Successfully wrote to {path}"
+                # Write file using echo or cat
+                if append:
+                    command = f"echo '{escaped_content}' >> {path}"
+                else:
+                    command = f"echo '{escaped_content}' > {path}"
+                
+                output = self.shell.execute_command(command, 10)
+                
+                # Verify file was written
+                verify_output = self.shell.execute_command(f"ls -la {path}", 5)
+                
+                return f"Wrote to {path}\nVerification:\n{verify_output}"
             except Exception as e:
                 return f"Error writing file: {str(e)}"
         
