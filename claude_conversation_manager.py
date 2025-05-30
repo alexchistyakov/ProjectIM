@@ -89,6 +89,20 @@ class ConversationManager:
                 }
             },
             {
+                "name": "change_directory",
+                "description": "Change the current working directory",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "The directory path to change to"
+                        }
+                    },
+                    "required": ["path"]
+                }
+            },
+            {
                 "name": "list_directory",
                 "description": "List contents of a directory",
                 "input_schema": {
@@ -145,9 +159,12 @@ class ConversationManager:
         # For now, we'll execute commands directly
         import subprocess
         
+        # Get the project directory (where this script is located)
+        project_dir = Path(__file__).parent.absolute()
+        
         if tool_name == "execute_command":
             command = arguments["command"]
-            working_dir = arguments.get("working_dir", ".")
+            working_dir = arguments.get("working_dir", str(project_dir))
             timeout = arguments.get("timeout", 30)
             
             try:
@@ -159,30 +176,51 @@ class ConversationManager:
                     text=True,
                     timeout=timeout
                 )
-                return f"Exit code: {result.returncode}\nSTDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
+                return f"Exit code: {result.returncode}\nWorkingDir: {working_dir}\nSTDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
             except subprocess.TimeoutExpired:
                 return f"Command timed out after {timeout} seconds"
             except Exception as e:
                 return f"Error executing command: {str(e)}"
         
-        elif tool_name == "list_directory":
-            path = arguments.get("path", ".")
+        elif tool_name == "change_directory":
+            path = arguments["path"]
             try:
+                # Convert relative paths to absolute paths based on project directory
+                if not Path(path).is_absolute():
+                    path = project_dir / path
+                
+                os.chdir(path)
+                return f"Successfully changed directory to {path}"
+            except Exception as e:
+                return f"Error changing directory: {str(e)}"
+        
+        elif tool_name == "list_directory":
+            path = arguments.get("path", str(project_dir))
+            try:
+                # Convert relative paths to absolute paths based on project directory
+                if not Path(path).is_absolute():
+                    path = project_dir / path
+                
                 items = []
                 for item in sorted(Path(path).iterdir()):
                     if item.is_dir():
                         items.append(f"[DIR]  {item.name}")
                     else:
                         items.append(f"[FILE] {item.name}")
-                return "\n".join(items)
+                return f"Directory: {path}\n" + "\n".join(items)
             except Exception as e:
                 return f"Error listing directory: {str(e)}"
         
         elif tool_name == "read_file":
             path = arguments["path"]
             try:
+                # Convert relative paths to absolute paths based on project directory
+                if not Path(path).is_absolute():
+                    path = project_dir / path
+                    
                 with open(path, 'r') as f:
-                    return f.read()
+                    content = f.read()
+                return f"File: {path}\n{content}"
             except Exception as e:
                 return f"Error reading file: {str(e)}"
         
@@ -191,6 +229,13 @@ class ConversationManager:
             content = arguments["content"]
             append = arguments.get("append", False)
             try:
+                # Convert relative paths to absolute paths based on project directory
+                if not Path(path).is_absolute():
+                    path = project_dir / path
+                
+                # Ensure parent directory exists
+                Path(path).parent.mkdir(parents=True, exist_ok=True)
+                
                 mode = 'a' if append else 'w'
                 with open(path, mode) as f:
                     f.write(content)
