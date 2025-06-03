@@ -19,9 +19,12 @@ from rich.markdown import Markdown
 import logging
 from pathlib import Path
 import subprocess
+import pty
+import select
+import termios
+import tty
 import time
 import re
-import select
 
 # Configure logging
 logging.basicConfig(
@@ -36,112 +39,253 @@ logger = logging.getLogger(__name__)
 console = Console()
 
 class PersistentShell:
-    """Maintains a persistent shell session using subprocess"""
+    """Maintains a persistent shell session"""
     
     def __init__(self, working_dir: str = None):
+        # Create a pseudo-terminal
+        self.master, slave = pty.openpty()
+        
+        # Set up environment - preserve the full environment to keep SSH agent access
+        env = os.environ.copy()
+        
+        # Ensure SSH-related variables are preserved
+        ssh_vars = ['SSH_AUTH_SOCK', 'SSH_AGENT_PID', 'SSH_CONNECTION', 'SSH_CLIENT']
+        for var in ssh_vars:
+            if var in os.environ:
+                env[var] = os.environ[var]
+        
+        # Also preserve Git-related variables
+        git_vars = ['GIT_SSH', 'GIT_SSH_COMMAND', 'GIT_ASKPASS']
+        for var in git_vars:
+            if var in os.environ:
+                env[var] = os.environ[var]
+        
+        # Preserve HOME to ensure access to .ssh directory
+        if 'HOME' in os.environ:
+            env['HOME'] = os.environ['HOME']
+            
+        # Set minimal prompt to avoid issues
+        env['PS1'] = '$ '  # Simple prompt without backslash escaping
+        env['PS2'] = '> '
+        env['TERM'] = 'dumb'  # Avoid terminal control sequences
+        
+        # Start bash with the user's profile to ensure proper initialization
+        # Use --login to source profile files and get the full user environment
+        self.shell = subprocess.Popen(
+            ['/bin/bash'],  # Use login shell to get full environment
+            stdin=slave,
+            stdout=slave,
+            stderr=slave,
+            cwd=working_dir,
+            env=env,
+            universal_newlines=False,
+            preexec_fn=os.setsid
+        )
+        os.close(slave)
         self.current_dir = working_dir or os.getcwd()
         
-        # Start a simple bash process with pipes
-        self.shell = subprocess.Popen(
-            ['/bin/bash'],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,  # Combine stderr with stdout
-            cwd=self.current_dir,
-            text=True,
-            bufsize=1,  # Line buffered
-            universal_newlines=True
-        )
+        # Set up the prompt explicitly
+        self._setup_shell()
         
-        logger.info(f"Started persistent shell in {self.current_dir}")
+        # Log SSH agent status for debugging
+        logger.info(f"SSH_AUTH_SOCK: {env.get('SSH_AUTH_SOCK', 'Not set')}")
+        logger.info(f"HOME: {env.get('HOME', 'Not set')}")
+        
+    def _setup_shell(self):
+        """Setup the shell with proper prompt"""
+        # Send commands to set up the shell
+        setup_commands = [
+            "PS1='$ '",  # Set simple prompt
+            "PS2='> '",
+            "set +o history",  # Disable history expansion
+            "stty -echo",  # Disable echo to avoid seeing commands twice
+            # Test SSH agent connection
+            "ssh-add -l > /dev/null 2>&1 && echo 'SSH agent available' || echo 'SSH agent not available'"
+        ]
+        
+        for cmd in setup_commands:
+            os.write(self.master, (cmd + '\n').encode())
+            time.sleep(0.1)
+        
+        # Clear any output from setup
+        self._clear_output(timeout=0.5)
+        
+    def _clear_output(self, timeout=0.5):
+        """Clear any pending output from the shell"""
+        import fcntl
+        
+        # Set non-blocking mode
+        flags = fcntl.fcntl(self.master, fcntl.F_GETFL)
+        fcntl.fcntl(self.master, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+        
+        start_time = time.time()
+        while time.time() - start_time < timeout:
+            try:
+                ready, _, _ = select.select([self.master], [], [], 0.1)
+                if ready:
+                    os.read(self.master, 4096)
+                else:
+                    break
+            except OSError:
+                break
+                
+        # Restore blocking mode
+        fcntl.fcntl(self.master, fcntl.F_SETFL, flags)
         
     def execute_command(self, command: str, timeout: int = 30) -> str:
-        """Execute a command in the shell and return output"""
+        """Execute a command in the shell"""
         try:
-            # Send command with a unique marker to detect end of output
-            marker = f"__END_CMD_{hash(command) % 10000}__"
-            full_command = f"timeout {timeout} {command}; echo '{marker}'"
+            import fcntl
             
-            # Write command to shell
-            self.shell.stdin.write(full_command + '\n')
-            self.shell.stdin.flush()
+            # Clear any pending output first
+            self._clear_output(timeout=0.2)
             
-            # Read output until we see our marker or timeout
-            output_lines = []
+            # Write the command to the shell
+            command_bytes = (command + '\n').encode('utf-8')
+            os.write(self.master, command_bytes)
+            
+            # Set non-blocking mode for reading
+            flags = fcntl.fcntl(self.master, fcntl.F_GETFL)
+            fcntl.fcntl(self.master, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+            
+            output_parts = []
             start_time = time.time()
+            last_output_time = start_time
             
-            while True:
-                if time.time() - start_time > timeout + 5:  # Extra buffer for cleanup
-                    logger.warning(f"Command timed out: {command}")
-                    break
-                
-                # Use select to check if there's data available
-                ready, _, _ = select.select([self.shell.stdout], [], [], 1.0)
-                
-                if ready:
-                    line = self.shell.stdout.readline()
-                    if not line:  # EOF
-                        break
-                        
-                    line = line.rstrip('\n')
+            try:
+                while True:
+                    current_time = time.time()
                     
-                    # Check if this is our end marker
-                    if line == marker:
+                    # Check for overall timeout
+                    if current_time - start_time > timeout:
+                        logger.warning(f"Command timed out after {timeout}s: {command}")
                         break
-                        
-                    output_lines.append(line)
-                else:
-                    # No data available - check if process is still alive
-                    if self.shell.poll() is not None:
-                        logger.error("Shell process died")
-                        break
+                    
+                    # Use select to wait for data with a short timeout
+                    ready, _, _ = select.select([self.master], [], [], 0.5)
+                    
+                    if ready:
+                        try:
+                            data = os.read(self.master, 4096)
+                            if data:
+                                output_parts.append(data.decode('utf-8', errors='replace'))
+                                last_output_time = current_time
+                            else:
+                                # EOF - shell might have closed
+                                break
+                        except OSError as e:
+                            if e.errno == 11:  # EAGAIN/EWOULDBLOCK
+                                continue
+                            else:
+                                logger.error(f"Error reading from shell: {e}")
+                                break
+                    else:
+                        # No data available - check if we should continue waiting
+                        # If no output for 2 seconds after command start, assume it's done
+                        if current_time - last_output_time > 2.0:
+                            break
+            
+            finally:
+                # Restore blocking mode
+                fcntl.fcntl(self.master, fcntl.F_SETFL, flags)
+            
+            # Join and clean up the output
+            raw_output = ''.join(output_parts)
+            
+            # Clean up the output by removing the echoed command and prompt
+            lines = raw_output.split('\n')
+            cleaned_lines = []
+            
+            # Skip lines that look like prompts or the echoed command
+            for line in lines:
+                stripped = line.strip()
+                # Skip empty lines, prompts, or the command itself
+                if (stripped and 
+                    not stripped.startswith('$ ') and 
+                    not stripped.startswith('> ') and
+                    stripped != command.strip()):
+                    cleaned_lines.append(line.rstrip())
+            
+            # Join the cleaned lines
+            result = '\n'.join(cleaned_lines).strip()
             
             # Update current directory if this was a cd command
             if command.strip().startswith('cd '):
-                self._update_current_dir()
+                try:
+                    # Get current directory from shell
+                    os.write(self.master, b'pwd\n')
+                    time.sleep(0.1)
+                    pwd_output = self._read_immediate_output()
+                    if pwd_output:
+                        new_dir = pwd_output.strip().split('\n')[-1].strip()
+                        if new_dir and new_dir.startswith('/'):
+                            self.current_dir = new_dir
+                            logger.debug(f"Updated current directory to: {self.current_dir}")
+                except Exception as e:
+                    logger.debug(f"Could not update current directory: {e}")
             
-            result = '\n'.join(output_lines)
-            logger.debug(f"Command executed: {command}")
+            logger.debug(f"Command '{command}' executed successfully")
             return result
             
         except Exception as e:
             error_msg = f"Failed to execute command '{command}': {str(e)}"
-            logger.error(error_msg)
+            logger.error(error_msg, exc_info=True)
             return error_msg
     
-    def _update_current_dir(self):
-        """Update the current directory by asking the shell"""
+    def _read_immediate_output(self, timeout: float = 1.0) -> str:
+        """Read immediate output from shell (helper method)"""
+        import fcntl
+        
+        # Set non-blocking mode
+        flags = fcntl.fcntl(self.master, fcntl.F_GETFL)
+        fcntl.fcntl(self.master, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+        
+        output_parts = []
+        start_time = time.time()
+        
         try:
-            pwd_marker = "__PWD_END__"
-            self.shell.stdin.write(f"pwd; echo '{pwd_marker}'\n")
-            self.shell.stdin.flush()
-            
-            while True:
-                line = self.shell.stdout.readline().rstrip('\n')
-                if line == pwd_marker:
-                    break
-                if line and line.startswith('/'):
-                    self.current_dir = line
-                    logger.debug(f"Updated current directory to: {self.current_dir}")
-                    break
-        except Exception as e:
-            logger.debug(f"Could not update current directory: {e}")
+            while time.time() - start_time < timeout:
+                ready, _, _ = select.select([self.master], [], [], 0.1)
+                if ready:
+                    try:
+                        data = os.read(self.master, 4096)
+                        if data:
+                            output_parts.append(data.decode('utf-8', errors='replace'))
+                        else:
+                            break
+                    except OSError as e:
+                        if e.errno == 11:  # EAGAIN
+                            continue
+                        break
+                else:
+                    if output_parts:  # If we have some output, we can stop
+                        break
+        finally:
+            # Restore blocking mode
+            fcntl.fcntl(self.master, fcntl.F_SETFL, flags)
+        
+        return ''.join(output_parts)
     
     def close(self):
         """Close the shell session"""
-        if self.shell and self.shell.poll() is None:
+        if hasattr(self, 'shell') and self.shell.poll() is None:
             try:
-                self.shell.stdin.write('exit\n')
-                self.shell.stdin.flush()
-                self.shell.wait(timeout=5)
+                # Send exit command
+                os.write(self.master, b'exit\n')
+                time.sleep(0.1)
             except:
+                pass
+            
+            # Terminate if still running
+            if self.shell.poll() is None:
                 self.shell.terminate()
-                try:
-                    self.shell.wait(timeout=5)
-                except:
-                    self.shell.kill()
-        
-        logger.info("Closed persistent shell")
+                self.shell.wait()
+                
+        if hasattr(self, 'master'):
+            try:
+                os.close(self.master)
+            except:
+                pass
 
 @dataclass
 class Message:
