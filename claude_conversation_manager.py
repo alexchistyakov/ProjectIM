@@ -140,97 +140,225 @@ class PersistentShell:
             # Clear any pending output first
             self._clear_output(timeout=0.2)
             
-            # Write the command to the shell
-            command_bytes = (command + '\n').encode('utf-8')
-            os.write(self.master, command_bytes)
+            # Check if this is a heredoc command
+            is_heredoc = self._is_heredoc_command(command)
             
-            # Set non-blocking mode for reading
-            flags = fcntl.fcntl(self.master, fcntl.F_GETFL)
-            fcntl.fcntl(self.master, fcntl.F_SETFL, flags | os.O_NONBLOCK)
-            
-            output_parts = []
-            start_time = time.time()
-            last_output_time = start_time
-            
-            try:
-                while True:
-                    current_time = time.time()
-                    
-                    # Check for overall timeout
-                    if current_time - start_time > timeout:
-                        logger.warning(f"Command timed out after {timeout}s: {command}")
-                        break
-                    
-                    # Use select to wait for data with a short timeout
-                    ready, _, _ = select.select([self.master], [], [], 0.5)
-                    
-                    if ready:
-                        try:
-                            data = os.read(self.master, 4096)
-                            if data:
-                                output_parts.append(data.decode('utf-8', errors='replace'))
-                                last_output_time = current_time
-                            else:
-                                # EOF - shell might have closed
-                                break
-                        except OSError as e:
-                            if e.errno == 11:  # EAGAIN/EWOULDBLOCK
-                                continue
-                            else:
-                                logger.error(f"Error reading from shell: {e}")
-                                break
-                    else:
-                        # No data available - check if we should continue waiting
-                        # If no output for 2 seconds after command start, assume it's done
-                        if current_time - last_output_time > 2.0:
-                            break
-            
-            finally:
-                # Restore blocking mode
-                fcntl.fcntl(self.master, fcntl.F_SETFL, flags)
-            
-            # Join and clean up the output
-            raw_output = ''.join(output_parts)
-            
-            # Clean up the output by removing the echoed command and prompt
-            lines = raw_output.split('\n')
-            cleaned_lines = []
-            
-            # Skip lines that look like prompts or the echoed command
-            for line in lines:
-                stripped = line.strip()
-                # Skip empty lines, prompts, or the command itself
-                if (stripped and 
-                    not stripped.startswith('$ ') and 
-                    not stripped.startswith('> ') and
-                    stripped != command.strip()):
-                    cleaned_lines.append(line.rstrip())
-            
-            # Join the cleaned lines
-            result = '\n'.join(cleaned_lines).strip()
-            
-            # Update current directory if this was a cd command
-            if command.strip().startswith('cd '):
-                try:
-                    # Get current directory from shell
-                    os.write(self.master, b'pwd\n')
-                    time.sleep(0.1)
-                    pwd_output = self._read_immediate_output()
-                    if pwd_output:
-                        new_dir = pwd_output.strip().split('\n')[-1].strip()
-                        if new_dir and new_dir.startswith('/'):
-                            self.current_dir = new_dir
-                            logger.debug(f"Updated current directory to: {self.current_dir}")
-                except Exception as e:
-                    logger.debug(f"Could not update current directory: {e}")
-            
-            logger.debug(f"Command '{command}' executed successfully")
-            return result
-            
+            if is_heredoc:
+                return self._execute_heredoc_command(command, timeout)
+            else:
+                return self._execute_simple_command(command, timeout)
+                
         except Exception as e:
             error_msg = f"Failed to execute command '{command}': {str(e)}"
             logger.error(error_msg, exc_info=True)
             return error_msg
+    
+    def _is_heredoc_command(self, command: str) -> bool:
+        """Check if command contains heredoc syntax"""
+        # Look for heredoc patterns like << EOF, << 'EOF', << "EOF", <<-EOF, etc.
+        import re
+        # Enhanced pattern to match various heredoc formats:
+        # - <<EOF, << EOF (with/without spaces)
+        # - <<'EOF', <<"EOF" (quoted delimiters)
+        # - <<-EOF (ignore leading tabs)
+        # - Support alphanumeric delimiters and underscores
+        heredoc_pattern = r'<<-?\s*[\'"]?([A-Za-z_][A-Za-z0-9_]*)[\'"]?'
+        return bool(re.search(heredoc_pattern, command))
+    
+    def _execute_heredoc_command(self, command: str, timeout: int = 30) -> str:
+        """Execute a heredoc command with proper multi-line handling"""
+        import fcntl
+        import re
+        
+        # Extract the delimiter from the command with enhanced pattern
+        heredoc_pattern = r'<<-?\s*[\'"]?([A-Za-z_][A-Za-z0-9_]*)[\'"]?'
+        match = re.search(heredoc_pattern, command)
+        if not match:
+            return self._execute_simple_command(command, timeout)
+        
+        delimiter = match.group(1)
+        # Check if it's a dash heredoc (<<-) which ignores leading tabs
+        is_dash_heredoc = '<<-' in command
+        logger.debug(f"Detected heredoc command with delimiter: {delimiter}, dash_heredoc: {is_dash_heredoc}")
+        
+        # Split command into lines
+        lines = command.strip().split('\n')
+        
+        # Send the first line (the command with heredoc operator)
+        first_line = lines[0] + '\n'
+        os.write(self.master, first_line.encode('utf-8'))
+        
+        # Wait a bit for shell to process and show PS2 prompt
+        time.sleep(0.1)
+        
+        # Send the content lines (everything except first line)
+        content_lines = lines[1:]
+        delimiter_found = False
+        
+        for line in content_lines:
+            # Check if this line is the delimiter
+            stripped_line = line.strip() if is_dash_heredoc else line
+            if stripped_line == delimiter:
+                delimiter_found = True
+            
+            os.write(self.master, (line + '\n').encode('utf-8'))
+            time.sleep(0.05)  # Small delay between lines
+        
+        # If no explicit delimiter was found in the content, we need to send one
+        if content_lines and not delimiter_found:
+            os.write(self.master, (delimiter + '\n').encode('utf-8'))
+        
+        # Set non-blocking mode for reading
+        flags = fcntl.fcntl(self.master, fcntl.F_GETFL)
+        fcntl.fcntl(self.master, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+        
+        output_parts = []
+        start_time = time.time()
+        last_output_time = start_time
+        delimiter_sent = False
+        
+        try:
+            while True:
+                current_time = time.time()
+                
+                # Check for overall timeout
+                if current_time - start_time > timeout:
+                    logger.warning(f"Heredoc command timed out after {timeout}s: {command}")
+                    break
+                
+                # Use select to wait for data
+                ready, _, _ = select.select([self.master], [], [], 0.5)
+                
+                if ready:
+                    try:
+                        data = os.read(self.master, 4096)
+                        if data:
+                            decoded_data = data.decode('utf-8', errors='replace')
+                            output_parts.append(decoded_data)
+                            last_output_time = current_time
+                            
+                            # Check if we see the PS2 prompt, indicating shell is waiting for more input
+                            if '> ' in decoded_data and not delimiter_sent and not content_lines:
+                                # If no content was provided, send the delimiter to close the heredoc
+                                os.write(self.master, (delimiter + '\n').encode('utf-8'))
+                                delimiter_sent = True
+                                logger.debug(f"Sent delimiter '{delimiter}' to close empty heredoc")
+                        else:
+                            # EOF - shell might have closed
+                            break
+                    except OSError as e:
+                        if e.errno == 11:  # EAGAIN/EWOULDBLOCK
+                            continue
+                        else:
+                            logger.error(f"Error reading from shell: {e}")
+                            break
+                else:
+                    # No data available - check if we should continue waiting
+                    # For heredoc commands, we need to wait longer as they might take time to process
+                    if current_time - last_output_time > 3.0:
+                        break
+        
+        finally:
+            # Restore blocking mode
+            fcntl.fcntl(self.master, fcntl.F_SETFL, flags)
+        
+        # Process the output
+        raw_output = ''.join(output_parts)
+        return self._clean_command_output(raw_output, command)
+    
+    def _execute_simple_command(self, command: str, timeout: int = 30) -> str:
+        """Execute a simple (non-heredoc) command"""
+        import fcntl
+        
+        # Write the command to the shell
+        command_bytes = (command + '\n').encode('utf-8')
+        os.write(self.master, command_bytes)
+        
+        # Set non-blocking mode for reading
+        flags = fcntl.fcntl(self.master, fcntl.F_GETFL)
+        fcntl.fcntl(self.master, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+        
+        output_parts = []
+        start_time = time.time()
+        last_output_time = start_time
+        
+        try:
+            while True:
+                current_time = time.time()
+                
+                # Check for overall timeout
+                if current_time - start_time > timeout:
+                    logger.warning(f"Command timed out after {timeout}s: {command}")
+                    break
+                
+                # Use select to wait for data with a short timeout
+                ready, _, _ = select.select([self.master], [], [], 0.5)
+                
+                if ready:
+                    try:
+                        data = os.read(self.master, 4096)
+                        if data:
+                            output_parts.append(data.decode('utf-8', errors='replace'))
+                            last_output_time = current_time
+                        else:
+                            # EOF - shell might have closed
+                            break
+                    except OSError as e:
+                        if e.errno == 11:  # EAGAIN/EWOULDBLOCK
+                            continue
+                        else:
+                            logger.error(f"Error reading from shell: {e}")
+                            break
+                else:
+                    # No data available - check if we should continue waiting
+                    # If no output for 2 seconds after command start, assume it's done
+                    if current_time - last_output_time > 2.0:
+                        break
+        
+        finally:
+            # Restore blocking mode
+            fcntl.fcntl(self.master, fcntl.F_SETFL, flags)
+        
+        # Process the output
+        raw_output = ''.join(output_parts)
+        return self._clean_command_output(raw_output, command)
+    
+    def _clean_command_output(self, raw_output: str, command: str) -> str:
+        """Clean up command output by removing prompts and echoed commands"""
+        # Clean up the output by removing the echoed command and prompt
+        lines = raw_output.split('\n')
+        cleaned_lines = []
+        
+        # Skip lines that look like prompts or the echoed command
+        for line in lines:
+            stripped = line.strip()
+            # Skip empty lines, prompts, or the command itself
+            if (stripped and 
+                not stripped.startswith('$ ') and 
+                not stripped.startswith('> ') and
+                stripped != command.strip()):
+                cleaned_lines.append(line.rstrip())
+        
+        # Join the cleaned lines
+        result = '\n'.join(cleaned_lines).strip()
+        
+        # Update current directory if this was a cd command
+        if command.strip().startswith('cd '):
+            try:
+                # Get current directory from shell
+                os.write(self.master, b'pwd\n')
+                time.sleep(0.1)
+                pwd_output = self._read_immediate_output()
+                if pwd_output:
+                    new_dir = pwd_output.strip().split('\n')[-1].strip()
+                    if new_dir and new_dir.startswith('/'):
+                        self.current_dir = new_dir
+                        logger.debug(f"Updated current directory to: {self.current_dir}")
+            except Exception as e:
+                logger.debug(f"Could not update current directory: {e}")
+        
+        logger.debug(f"Command '{command}' executed successfully")
+        return result
     
     def _read_immediate_output(self, timeout: float = 1.0) -> str:
         """Read immediate output from shell (helper method)"""
