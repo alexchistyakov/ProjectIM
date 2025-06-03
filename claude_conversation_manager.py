@@ -21,6 +21,7 @@ from pathlib import Path
 import subprocess
 import time
 import re
+import select
 
 # Configure logging
 logging.basicConfig(
@@ -59,32 +60,41 @@ class PersistentShell:
         try:
             # Send command with a unique marker to detect end of output
             marker = f"__END_CMD_{hash(command) % 10000}__"
-            full_command = f"{command}; echo '{marker}'"
+            full_command = f"timeout {timeout} {command}; echo '{marker}'"
             
             # Write command to shell
             self.shell.stdin.write(full_command + '\n')
             self.shell.stdin.flush()
             
-            # Read output until we see our marker
+            # Read output until we see our marker or timeout
             output_lines = []
             start_time = time.time()
             
             while True:
-                if time.time() - start_time > timeout:
+                if time.time() - start_time > timeout + 5:  # Extra buffer for cleanup
                     logger.warning(f"Command timed out: {command}")
                     break
-                    
-                line = self.shell.stdout.readline()
-                if not line:  # EOF
-                    break
-                    
-                line = line.rstrip('\n')
                 
-                # Check if this is our end marker
-                if line == marker:
-                    break
+                # Use select to check if there's data available
+                ready, _, _ = select.select([self.shell.stdout], [], [], 1.0)
+                
+                if ready:
+                    line = self.shell.stdout.readline()
+                    if not line:  # EOF
+                        break
+                        
+                    line = line.rstrip('\n')
                     
-                output_lines.append(line)
+                    # Check if this is our end marker
+                    if line == marker:
+                        break
+                        
+                    output_lines.append(line)
+                else:
+                    # No data available - check if process is still alive
+                    if self.shell.poll() is not None:
+                        logger.error("Shell process died")
+                        break
             
             # Update current directory if this was a cd command
             if command.strip().startswith('cd '):
