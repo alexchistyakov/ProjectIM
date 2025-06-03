@@ -24,6 +24,7 @@ import select
 import termios
 import tty
 import time
+import re
 
 # Configure logging
 logging.basicConfig(
@@ -132,108 +133,138 @@ class PersistentShell:
         fcntl.fcntl(self.master, fcntl.F_SETFL, flags)
         
     def execute_command(self, command: str, timeout: int = 30) -> str:
-        """Execute a command in the persistent shell"""
-        # Clear any pending output first
-        self._clear_output(timeout=0.1)
-        
-        # Send command with unique marker
-        marker = f"__MARKER_{int(time.time()*1000)}__"
-        full_command = f"{command}; echo {marker}$?"
-        os.write(self.master, (full_command + '\n').encode())
-        
-        # Read output
-        output = []
-        start_time = time.time()
-        marker_found = False
-        exit_code = None
-        
-        # Increase buffer size for larger outputs
-        buffer_size = 262144  # 256KB for better performance
-        accumulated_buffer = ""  # Buffer to accumulate partial reads
-        
-        while time.time() - start_time < timeout:
-            ready, _, _ = select.select([self.master], [], [], 0.1)
-            if ready:
-                try:
-                    chunk = os.read(self.master, buffer_size).decode('utf-8', errors='replace')
-                    accumulated_buffer += chunk
+        """Execute a command in the shell"""
+        try:
+            import fcntl
+            
+            # Clear any pending output first
+            self._clear_output(timeout=0.2)
+            
+            # Write the command to the shell
+            command_bytes = (command + '\n').encode('utf-8')
+            os.write(self.master, command_bytes)
+            
+            # Set non-blocking mode for reading
+            flags = fcntl.fcntl(self.master, fcntl.F_GETFL)
+            fcntl.fcntl(self.master, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+            
+            output_parts = []
+            start_time = time.time()
+            last_output_time = start_time
+            
+            try:
+                while True:
+                    current_time = time.time()
                     
-                    # Look for our marker in the accumulated buffer
-                    if marker in accumulated_buffer:
-                        marker_found = True
-                        # Extract exit code and output before marker
-                        parts = accumulated_buffer.split(marker)
-                        if len(parts) >= 2:
-                            output.append(parts[0])
-                            # Try to extract exit code
-                            exit_code_part = parts[1].split('\n')[0].strip()
-                            if exit_code_part.isdigit():
-                                exit_code = int(exit_code_part)
-                        
-                        # Collect any remaining output (especially for git operations)
-                        remaining_output = []
-                        end_time = time.time() + 1.0  # Give more time for remaining output
-                        while time.time() < end_time:
-                            ready, _, _ = select.select([self.master], [], [], 0.05)
-                            if ready:
-                                try:
-                                    extra_chunk = os.read(self.master, buffer_size).decode('utf-8', errors='replace')
-                                    if extra_chunk and marker not in extra_chunk:
-                                        remaining_output.append(extra_chunk)
-                                    else:
-                                        # If we see our marker again or empty output, we're done
-                                        if not extra_chunk:
-                                            break
-                                except OSError:
-                                    break
-                            else:
-                                # No more data available
-                                break
-                        
-                        if remaining_output:
-                            output.extend(remaining_output)
+                    # Check for overall timeout
+                    if current_time - start_time > timeout:
+                        logger.warning(f"Command timed out after {timeout}s: {command}")
                         break
+                    
+                    # Use select to wait for data with a short timeout
+                    ready, _, _ = select.select([self.master], [], [], 0.5)
+                    
+                    if ready:
+                        try:
+                            data = os.read(self.master, 4096)
+                            if data:
+                                output_parts.append(data.decode('utf-8', errors='replace'))
+                                last_output_time = current_time
+                            else:
+                                # EOF - shell might have closed
+                                break
+                        except OSError as e:
+                            if e.errno == 11:  # EAGAIN/EWOULDBLOCK
+                                continue
+                            else:
+                                logger.error(f"Error reading from shell: {e}")
+                                break
                     else:
-                        # Process complete lines from accumulated buffer
-                        lines = accumulated_buffer.split('\n')
-                        if len(lines) > 1:
-                            # Keep the last incomplete line in the buffer
-                            output.extend(lines[:-1])
-                            output.append('\n')  # Add newline back
-                            accumulated_buffer = lines[-1]
-                        
-                except OSError as e:
-                    if e.errno == 5:  # Input/output error
-                        return "Shell process terminated"
-                    raise
-            else:
-                # Check if process is still alive
-                if self.shell.poll() is not None:
-                    return "Shell process terminated"
-        
-        # Add any remaining buffer content
-        if accumulated_buffer and not marker_found:
-            output.append(accumulated_buffer)
-        
-        if not marker_found:
-            # For long-running commands, return partial output with timeout message
-            partial_output = ''.join(output)
-            return f"{partial_output}\n\n[Command timed out after {timeout} seconds. Consider using a longer timeout for this command.]"
+                        # No data available - check if we should continue waiting
+                        # If no output for 2 seconds after command start, assume it's done
+                        if current_time - last_output_time > 2.0:
+                            break
             
-        # Join output and clean it up
-        result = ''.join(output)
-        
-        # Remove the command echo if present
-        lines = result.split('\n')
-        if lines and command in lines[0]:
-            lines = lines[1:]
-        result = '\n'.join(lines).strip()
-        
-        # Add exit code info if command failed
-        if exit_code and exit_code != 0:
-            result += f"\n[Exit code: {exit_code}]"
+            finally:
+                # Restore blocking mode
+                fcntl.fcntl(self.master, fcntl.F_SETFL, flags)
             
-        return result
+            # Join and clean up the output
+            raw_output = ''.join(output_parts)
+            
+            # Clean up the output by removing the echoed command and prompt
+            lines = raw_output.split('\n')
+            cleaned_lines = []
+            
+            # Skip lines that look like prompts or the echoed command
+            for line in lines:
+                stripped = line.strip()
+                # Skip empty lines, prompts, or the command itself
+                if (stripped and 
+                    not stripped.startswith('$ ') and 
+                    not stripped.startswith('> ') and
+                    stripped != command.strip()):
+                    cleaned_lines.append(line.rstrip())
+            
+            # Join the cleaned lines
+            result = '\n'.join(cleaned_lines).strip()
+            
+            # Update current directory if this was a cd command
+            if command.strip().startswith('cd '):
+                try:
+                    # Get current directory from shell
+                    os.write(self.master, b'pwd\n')
+                    time.sleep(0.1)
+                    pwd_output = self._read_immediate_output()
+                    if pwd_output:
+                        new_dir = pwd_output.strip().split('\n')[-1].strip()
+                        if new_dir and new_dir.startswith('/'):
+                            self.current_dir = new_dir
+                            logger.debug(f"Updated current directory to: {self.current_dir}")
+                except Exception as e:
+                    logger.debug(f"Could not update current directory: {e}")
+            
+            logger.debug(f"Command '{command}' executed successfully")
+            return result
+            
+        except Exception as e:
+            error_msg = f"Failed to execute command '{command}': {str(e)}"
+            logger.error(error_msg, exc_info=True)
+            return error_msg
+    
+    def _read_immediate_output(self, timeout: float = 1.0) -> str:
+        """Read immediate output from shell (helper method)"""
+        import fcntl
+        
+        # Set non-blocking mode
+        flags = fcntl.fcntl(self.master, fcntl.F_GETFL)
+        fcntl.fcntl(self.master, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+        
+        output_parts = []
+        start_time = time.time()
+        
+        try:
+            while time.time() - start_time < timeout:
+                ready, _, _ = select.select([self.master], [], [], 0.1)
+                if ready:
+                    try:
+                        data = os.read(self.master, 4096)
+                        if data:
+                            output_parts.append(data.decode('utf-8', errors='replace'))
+                        else:
+                            break
+                    except OSError as e:
+                        if e.errno == 11:  # EAGAIN
+                            continue
+                        break
+                else:
+                    if output_parts:  # If we have some output, we can stop
+                        break
+        finally:
+            # Restore blocking mode
+            fcntl.fcntl(self.master, fcntl.F_SETFL, flags)
+        
+        return ''.join(output_parts)
     
     def close(self):
         """Close the shell session"""
