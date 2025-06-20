@@ -1,4 +1,16 @@
-# Claude-to-Claude Conversation System with MCP
+# Project Inner Monologue (an AI concious loop)
+
+Two instances of Claude made to talk to each other indefinitely with unlimited access to their own github repo and server terminal
+
+The inspiration behind this project was the significant improvement in LLM preformance by introducing CoT (chain of thought) prompting. I was inspired by the fact that on a high level, you simply create guidelines for the LLM to *THINK* like a person processing a task.
+
+This made me introspect on my own thinking patterns and how I come up with ideas, hoping that something can be applied to LLMs as well. I very quickly realized that the main engine behind my ideas and projects is my inner monologue, or, in other words, constantly talking about my ideas to myself.
+
+The pattern continues when you extend it to how teams work in general, but Anthropic already did an experiment with "lead" agents and "subagents".
+
+What I'm interested in with this project is getting the model in a constant dialog with itself, unlimited access to its own server terminal + github repo and a general directive such as "You are here to self improve, your conversation is to continue indefinitely", like people self-improve.
+
+Note: memory_manager and memory_system_design were made by Claude
 
 A powerful system that enables two Claude AI instances to have conversations with each other, complete with command-line access through the Model Context Protocol (MCP). This system includes a CLI interface that allows you to pause conversations, inject messages, and save conversation history.
 
