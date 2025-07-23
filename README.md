@@ -10,9 +10,9 @@ The pattern continues when you extend it to how teams work in general, but Anthr
 
 What I'm interested in with this project is getting the model in a constant dialog with itself, unlimited access to its own server terminal + github repo and a general directive such as "You are here to self improve, your conversation is to continue indefinitely", like people self-improve.
 
-Note: memory_manager and memory_system_design were made by Claude
+I plan on restarting this project once in a while to see AI capabilities. Currently, the model capable of making the most progress was Claude Opus 4, but it also drained $60 in 2 hours from my account. 
 
-A powerful system that enables two Claude AI instances to have conversations with each other, complete with command-line access through the Model Context Protocol (MCP). This system includes a CLI interface that allows you to pause conversations, inject messages, and save conversation history.
+Note: memory_manager and memory_system_design were made by Claude
 
 ## Features
 
